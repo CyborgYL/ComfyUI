@@ -5,9 +5,11 @@ from typing import Dict, Optional
 import numpy as np
 import torch
 import torch.nn as nn
-from .. import attention
+from ..attention import optimized_attention
 from einops import rearrange, repeat
 from .util import timestep_embedding
+import comfy.ops
+import comfy.ldm.common_dit
 
 def default(x, y):
     if x is not None:
@@ -69,12 +71,14 @@ class PatchEmbed(nn.Module):
             bias: bool = True,
             strict_img_size: bool = True,
             dynamic_img_pad: bool = True,
+            padding_mode='circular',
             dtype=None,
             device=None,
             operations=None,
     ):
         super().__init__()
         self.patch_size = (patch_size, patch_size)
+        self.padding_mode = padding_mode
         if img_size is not None:
             self.img_size = (img_size, img_size)
             self.grid_size = tuple([s // p for s, p in zip(self.img_size, self.patch_size)])
@@ -108,9 +112,7 @@ class PatchEmbed(nn.Module):
         #             f"Input width ({W}) should be divisible by patch size ({self.patch_size[1]})."
         #         )
         if self.dynamic_img_pad:
-            pad_h = (self.patch_size[0] - H % self.patch_size[0]) % self.patch_size[0]
-            pad_w = (self.patch_size[1] - W % self.patch_size[1]) % self.patch_size[1]
-            x = torch.nn.functional.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
+            x = comfy.ldm.common_dit.pad_to_patch_size(x, self.patch_size, padding_mode=self.padding_mode)
         x = self.proj(x)
         if self.flatten:
             x = x.flatten(2).transpose(1, 2)  # NCHW -> NLC
@@ -264,8 +266,6 @@ def split_qkv(qkv, head_dim):
     qkv = qkv.reshape(qkv.shape[0], qkv.shape[1], 3, -1, head_dim).movedim(2, 0)
     return qkv[0], qkv[1], qkv[2]
 
-def optimized_attention(qkv, num_heads):
-    return attention.optimized_attention(qkv[0], qkv[1], qkv[2], num_heads)
 
 class SelfAttention(nn.Module):
     ATTENTION_MODES = ("xformers", "torch", "torch-hb", "math", "debug")
@@ -324,9 +324,9 @@ class SelfAttention(nn.Module):
         return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        qkv = self.pre_attention(x)
+        q, k, v = self.pre_attention(x)
         x = optimized_attention(
-            qkv, num_heads=self.num_heads
+            q, k, v, heads=self.num_heads
         )
         x = self.post_attention(x)
         return x
@@ -353,29 +353,9 @@ class RMSNorm(torch.nn.Module):
         else:
             self.register_parameter("weight", None)
 
-    def _norm(self, x):
-        """
-        Apply the RMSNorm normalization to the input tensor.
-        Args:
-            x (torch.Tensor): The input tensor.
-        Returns:
-            torch.Tensor: The normalized tensor.
-        """
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
     def forward(self, x):
-        """
-        Forward pass through the RMSNorm layer.
-        Args:
-            x (torch.Tensor): The input tensor.
-        Returns:
-            torch.Tensor: The output tensor after applying RMSNorm.
-        """
-        x = self._norm(x)
-        if self.learnable_scale:
-            return x * self.weight.to(device=x.device, dtype=x.dtype)
-        else:
-            return x
+        return comfy.ldm.common_dit.rms_norm(x, self.weight, self.eps)
+
 
 
 class SwiGLUFeedForward(nn.Module):
@@ -549,8 +529,8 @@ class DismantledBlock(nn.Module):
         assert not self.pre_only
         qkv, intermediates = self.pre_attention(x, c)
         attn = optimized_attention(
-            qkv,
-            num_heads=self.attn.num_heads,
+            qkv[0], qkv[1], qkv[2],
+            heads=self.attn.num_heads,
         )
         return self.post_attention(attn, *intermediates)
 
@@ -575,8 +555,8 @@ def _block_mixing(context, x, context_block, x_block, c):
     qkv = tuple(o)
 
     attn = optimized_attention(
-        qkv,
-        num_heads=x_block.attn.num_heads,
+        qkv[0], qkv[1], qkv[2],
+        heads=x_block.attn.num_heads,
     )
     context_attn, x_attn = (
         attn[:, : context_qkv[0].shape[1]],
@@ -660,7 +640,7 @@ class SelfAttentionContext(nn.Module):
     def forward(self, x):
         qkv = self.qkv(x)
         q, k, v = split_qkv(qkv, self.dim_head)
-        x = optimized_attention((q.reshape(q.shape[0], q.shape[1], -1), k, v), self.heads)
+        x = optimized_attention(q.reshape(q.shape[0], q.shape[1], -1), k, v, heads=self.heads)
         return self.proj(x)
 
 class ContextProcessorBlock(nn.Module):
@@ -924,7 +904,7 @@ class MMDiT(nn.Module):
             context = self.context_processor(context)
 
         hw = x.shape[-2:]
-        x = self.x_embedder(x) + self.cropped_pos_embed(hw, device=x.device).to(dtype=x.dtype, device=x.device)
+        x = self.x_embedder(x) + comfy.ops.cast_to_input(self.cropped_pos_embed(hw, device=x.device), x)
         c = self.t_embedder(t, dtype=x.dtype)  # (N, D)
         if y is not None and self.y_embedder is not None:
             y = self.y_embedder(y)  # (N, D)
