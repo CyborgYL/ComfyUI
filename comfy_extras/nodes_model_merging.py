@@ -91,6 +91,7 @@ class CLIPMergeSimple:
 
 
 class CLIPSubtract:
+    SEARCH_ALIASES = ["clip difference", "text encoder subtract"]
     @classmethod
     def INPUT_TYPES(s):
         return {"required": { "clip1": ("CLIP",),
@@ -113,6 +114,7 @@ class CLIPSubtract:
 
 
 class CLIPAdd:
+    SEARCH_ALIASES = ["combine clip"]
     @classmethod
     def INPUT_TYPES(s):
         return {"required": { "clip1": ("CLIP",),
@@ -209,6 +211,9 @@ def save_checkpoint(model, clip=None, vae=None, clip_vision=None, filename_prefi
         metadata["modelspec.predict_key"] = "epsilon"
     elif model.model.model_type == comfy.model_base.ModelType.V_PREDICTION:
         metadata["modelspec.predict_key"] = "v"
+        extra_keys["v_pred"] = torch.tensor([])
+        if getattr(model_sampling, "zsnr", False):
+            extra_keys["ztsnr"] = torch.tensor([])
 
     if not args.disable_metadata:
         metadata["prompt"] = prompt_info
@@ -222,6 +227,7 @@ def save_checkpoint(model, clip=None, vae=None, clip_vision=None, filename_prefi
     comfy.sd.save_checkpoint(output_checkpoint, model, clip, vae, clip_vision, metadata=metadata, extra_keys=extra_keys)
 
 class CheckpointSave:
+    SEARCH_ALIASES = ["save model", "export checkpoint", "merge save"]
     def __init__(self):
         self.output_dir = folder_paths.get_output_directory()
 
@@ -273,7 +279,7 @@ class CLIPSave:
         comfy.model_management.load_models_gpu([clip.load_model()], force_patch_weights=True)
         clip_sd = clip.get_sd()
 
-        for prefix in ["clip_l.", "clip_g.", ""]:
+        for prefix in ["clip_l.", "clip_g.", "clip_h.", "t5xxl.", "pile_t5xl.", "mt5xl.", "umt5xxl.", "t5base.", "gemma2_2b.", "llama.", "hydit_clip.", ""]:
             k = list(filter(lambda a: a.startswith(prefix), clip_sd.keys()))
             current_clip_sd = {}
             for x in k:
@@ -334,6 +340,7 @@ class VAESave:
         return {}
 
 class ModelSave:
+    SEARCH_ALIASES = ["export model", "checkpoint save"]
     def __init__(self):
         self.output_dir = folder_paths.get_output_directory()
 
